@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-app
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: simple-go-service
+  name: simple-go-service
+  namespace: demo-app
+spec:
+  serviceName: simple-go-service
+  podManagementPolicy: "Parallel"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple-go-service
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: 'true'
+        prometheus.io/port: "9090"
+      labels:
+        app: simple-go-service
+      name: simple-go-service
+    spec:
+      serviceAccountName: simple-go-service
+      containers:
+        - name: simple-go-service
+          image: gcr.io/elastic-cloud-dev/michael/simple-go-service-amd64-2:latest
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+          args:
+            - /simple-go-service
+            - "-oscillation-period=1m"
+            - "-listen-address=:9090"
+          ports:
+            - containerPort: 9090
+              name: prometheus
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: simple-go-service
+  namespace: demo-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-go-service
+  namespace: demo-app
+spec:
+  ports:
+    - name: prometheus
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: simple-go-service

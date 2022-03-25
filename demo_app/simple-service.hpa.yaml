@@ -1,0 +1,24 @@
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: simple-go-service
+  namespace: demo-app
+spec:
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: follow_me
+        target:
+          type: AverageValue
+          averageValue: "1"
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: simple-go-service
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 10

@@ -1,0 +1,330 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prometheus-custom-metrics
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: custom-metrics-apiserver
+  namespace: prometheus-custom-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-metrics-resource-reader
+rules:
+  - apiGroups: ["elasticsearch.k8s.elastic.co"]
+    resources: ["elasticsearches"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apm.k8s.elastic.co"]
+    resources: ["apmservers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kibana.k8s.elastic.co"]
+    resources: ["kibanas"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["enterprisesearch.k8s.elastic.co"]
+    resources: ["enterprisesearches"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["beat.k8s.elastic.co"]
+    resources: ["beats"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["agent.k8s.elastic.co"]
+    resources: ["agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["maps.k8s.elastic.co"]
+    resources: ["elasticmapsservers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - nodes
+      - nodes/stats
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-metrics-server-resources
+rules:
+  - apiGroups:
+      - custom.metrics.k8s.io
+      - external.metrics.k8s.io
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hpa-controller-custom-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-metrics-server-resources
+subjects:
+  - kind: ServiceAccount
+    name: horizontal-pod-autoscaler
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: prometheus-custom-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: custom-metrics-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: prometheus-custom-metrics
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: custom-metrics-resource-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: custom-metrics-resource-reader
+subjects:
+  - kind: ServiceAccount
+    name: custom-metrics-apiserver
+    namespace: prometheus-custom-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: custom-metrics-apiserver
+  name: custom-metrics-apiserver
+  namespace: prometheus-custom-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-metrics-apiserver
+  template:
+    metadata:
+      labels:
+        app: custom-metrics-apiserver
+      name: custom-metrics-apiserver
+    spec:
+      serviceAccountName: custom-metrics-apiserver
+      containers:
+        - name: custom-metrics-apiserver
+          image: directxman12/k8s-prometheus-adapter-amd64
+          args:
+            - --secure-port=6443
+            - --tls-cert-file=/var/run/serving-cert/serving.crt
+            - --tls-private-key-file=/var/run/serving-cert/serving.key
+            - --logtostderr=true
+            - --prometheus-url=http://prometheus-server.prometheus-monitoring.svc/
+            - --metrics-relist-interval=1m
+            - --v=2
+            - --config=/etc/adapter/config.yaml
+          ports:
+            - containerPort: 6443
+          volumeMounts:
+            - mountPath: /var/run/serving-cert
+              name: volume-serving-cert
+              readOnly: true
+            - mountPath: /etc/adapter/
+              name: config
+              readOnly: true
+            - mountPath: /tmp
+              name: tmp-vol
+      volumes:
+        - name: volume-serving-cert
+          secret:
+            secretName: cm-adapter-serving-certs
+        - name: config
+          configMap:
+            name: adapter-config
+        - name: tmp-vol
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-metrics-apiserver
+  namespace: prometheus-custom-metrics
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 443
+      targetPort: 6443
+  selector:
+    app: custom-metrics-apiserver
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: adapter-config
+  namespace: prometheus-custom-metrics
+data:
+  config.yaml: |
+    rules:
+    - seriesQuery: '{__name__=~"^container_.*",container!="POD",namespace!="",pod!=""}'
+      seriesFilters: []
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: ^container_(.*)_seconds_total$
+        as: ""
+      metricsQuery: sum(rate(<<.Series>>{<<.LabelMatchers>>,container!="POD"}[1m])) by (<<.GroupBy>>)
+    - seriesQuery: '{__name__=~"^container_.*",container!="POD",namespace!="",pod!=""}'
+      seriesFilters:
+      - isNot: ^container_.*_seconds_total$
+      resources:
+        overrides:
+          # field (or label in the case of Prometheus)
+          job: { group: "kibana.k8s.elastic.co" , resource: "kibanas"}
+      name:
+        matches: ^container_(.*)_total$
+        as: "${1}.job.as.kibana"
+      metricsQuery: sum(rate(<<.Series>>{<<.LabelMatchers>>,container!="POD"}[1m])) by (<<.GroupBy>>)
+    - seriesQuery: '{__name__=~"^container_.*",container!="POD",namespace!="",pod!=""}'
+      seriesFilters:
+      - isNot: ^container_.*_total$
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+          pod:
+            resource: pod
+      name:
+        matches: ^container_(.*)$
+        as: ""
+      metricsQuery: sum(<<.Series>>{<<.LabelMatchers>>,container!="POD"}) by (<<.GroupBy>>)
+    - seriesQuery: '{namespace!="",__name__!~"^container_.*"}'
+      seriesFilters:
+      - isNot: .*_total$
+      resources:
+        template: <<.Resource>>
+      name:
+        matches: ""
+        as: ""
+      metricsQuery: sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)
+    - seriesQuery: '{namespace!="",__name__!~"^container_.*"}'
+      seriesFilters:
+      - isNot: .*_seconds_total
+      resources:
+        template: <<.Resource>>
+      name:
+        matches: ^(.*)_total$
+        as: ""
+      metricsQuery: sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)
+    - seriesQuery: '{namespace!="",__name__!~"^container_.*"}'
+      seriesFilters: []
+      resources:
+        template: <<.Resource>>
+      name:
+        matches: ^(.*)_seconds_total$
+        as: ""
+      metricsQuery: sum(rate(<<.Series>>{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)
+    resourceRules:
+      cpu:
+        containerQuery: sum(rate(container_cpu_usage_seconds_total{<<.LabelMatchers>>}[1m])) by (<<.GroupBy>>)
+        nodeQuery: sum(rate(container_cpu_usage_seconds_total{<<.LabelMatchers>>, id='/'}[1m])) by (<<.GroupBy>>)
+        resources:
+          overrides:
+            instance:
+              resource: node
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        containerLabel: container
+      memory:
+        containerQuery: sum(container_memory_working_set_bytes{<<.LabelMatchers>>}) by (<<.GroupBy>>)
+        nodeQuery: sum(container_memory_working_set_bytes{<<.LabelMatchers>>,id='/'}) by (<<.GroupBy>>)
+        resources:
+          overrides:
+            instance:
+              resource: node
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        containerLabel: container
+      window: 1m
+    externalRules:
+    - seriesQuery: '{__name__=~"^.*_queue_(length|size)$",namespace!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+      name:
+        matches: ^.*_queue_(length|size)$
+        as: "$0"
+      metricsQuery: max(<<.Series>>{<<.LabelMatchers>>})
+    - seriesQuery: '{__name__=~"^.*_queue$",namespace!=""}'
+      resources:
+        overrides:
+          namespace:
+            resource: namespace
+      name:
+        matches: ^.*_queue$
+        as: "$0"
+      metricsQuery: max(<<.Series>>{<<.LabelMatchers>>})
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.custom.metrics.k8s.io
+spec:
+  service:
+    name: prometheus-metrics-apiserver
+    namespace: prometheus-custom-metrics
+  group: custom.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta2.custom.metrics.k8s.io
+spec:
+  service:
+    name: prometheus-metrics-apiserver
+    namespace: prometheus-custom-metrics
+  group: custom.metrics.k8s.io
+  version: v1beta2
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 200
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cm-adapter-serving-certs
+  namespace: prometheus-custom-metrics
+data:
+  serving.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURlVENDQW1HZ0F3SUJBZ0lVTktRejJTMzRBejJpQ2lqT3ZheVNCalY4ZnVRd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0RURUxNQWtHQTFVRUF3d0NZMkV3SGhjTk1qRXdPVEV6TVRJeU56QXdXaGNOTWpZd09URXlNVEl5TnpBdwpXakFqTVNFd0h3WURWUVFERXhoamRYTjBiMjB0YldWMGNtbGpjeTFoY0dselpYSjJaWEl3Z2dFaU1BMEdDU3FHClNJYjNEUUVCQVFVQUE0SUJEd0F3Z2dFS0FvSUJBUURMTU5MZENXcXBxay9rRmEvdFRLWlJtQ0dzdUtRTVJiaCsKRXJJQ3FPQzFSYWJTVXlWTkNpZkJmbHozQU9LZkFIZ0tydkdDd0lpaXo0T3pwOG5FdE9SU0l6WVMyeHY0RTNWLwpFYVMzd3BHeDZ5aWJnanNiOEVWYVA5RmYrTEFOUUp0b3ZJYUx2aTNvUkdBUlM2bHQyaUNHSEdGTmZmaTVwVWRBCkxPcWFETCtkekhYWjNhajZabDJOL1J3a0I1a2I1VHhWeVEvM0NhQm03WWNRK0xoWGtQWUk5NGltL0tSRkdHVXYKNHgydVJuZWtKMFBMblVBVU93YVVHZ2FDRmJNTnJUVWhNU04xYlZ2UjJBZkM4aStSSXZlWXJ2YmcxaGREelJobwpTUDBTdmtESFZRTk95d0ZXa25xL01EM3MxVENzWkhhaE9UTDl5ZVBwZlJwNlQwM0g1czVuQWdNQkFBR2pnYm93CmdiY3dEZ1lEVlIwUEFRSC9CQVFEQWdXZ01Bd0dBMVVkRXdFQi93UUNNQUF3SFFZRFZSME9CQllFRkQ1YnNWSTEKdG1EN3dXQjdtZ3Y2QnVLY1ppL2lNQjhHQTFVZEl3UVlNQmFBRkY5ZjJ6YVNJUzJUZFpScExrWVFwTjhpNlVabApNRmNHQTFVZEVRUlFNRTZDSTJOMWMzUnZiUzF0WlhSeWFXTnpMV0Z3YVhObGNuWmxjaTV0YjI1cGRHOXlhVzVuCmdpZGpkWE4wYjIwdGJXVjBjbWxqY3kxaGNHbHpaWEoyWlhJdWJXOXVhWFJ2Y21sdVp5NXpkbU13RFFZSktvWkkKaHZjTkFRRUxCUUFEZ2dFQkFHVlhoQzk0ZGdvK2hnSTYzcWljZnBrMFJJeDJ3aE1saXl6YU5PWnlSMDNtYlFvawo0bWQxUEk4dlBlbTNrTmVrU2N2ejRZcEZ3aGRLVEFHTlpPY3lPNGZnUlMwVkQ4UjJzNFhOS1hjMHpyekhSYmdJCnJhK2czdE9OcHZBSUlWY0VkYmQ5cmFhN05QM1psZDJGL0JVNlp2cjNhTDBoWjAwbS9IbDJwbzdPRW9iMFk5eloKU3lRSnhKY0JlM0szdUk5cW4yZkRpbU5hK2tMZVoreXBPUTNHNE9Ib2gxbTB4ZDBneWRkMFlwZlJTKzdSMmRiRgpJei9jUTJHUExuSW5ZR3J0LzQ3S1JJZDZkVzkwYXpaaWxLUEYyMm02U29ydFZuekFXYzVVcDNSZThGNVU0UzdBCm1RTVdLei81ajRYbGt1UThVSHZRRCtqZ0lyKzhSRGpLVkpyejlpQT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+  serving.key: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFb2dJQkFBS0NBUUVBeXpEUzNRbHFxYXBQNUJXdjdVeW1VWmdockxpa0RFVzRmaEt5QXFqZ3RVV20wbE1sClRRb253WDVjOXdEaW53QjRDcTd4Z3NDSW9zK0RzNmZKeExUa1VpTTJFdHNiK0JOMWZ4R2t0OEtSc2Vzb200STcKRy9CRldqL1JYL2l3RFVDYmFMeUdpNzR0NkVSZ0VVdXBiZG9naGh4aFRYMzR1YVZIUUN6cW1neS9uY3gxMmQybworbVpkamYwY0pBZVpHK1U4VmNrUDl3bWdadTJIRVBpNFY1RDJDUGVJcHZ5a1JSaGxMK01kcmtaM3BDZER5NTFBCkZEc0dsQm9HZ2hXekRhMDFJVEVqZFcxYjBkZ0h3dkl2a1NMM21LNzI0TllYUTgwWWFFajlFcjVBeDFVRFRzc0IKVnBKNnZ6QTk3TlV3ckdSMm9Ua3kvY25qNlgwYWVrOU54K2JPWndJREFRQUJBb0lCQURXd2gvYzU5c0l3SzM0RQpNUUZPQUtDTXgxRWhWTStkV0p1UGl4UGkxY1Z3U3gxR05SUC9PL1FIMUw2N3NDWDlkTHExOFVEd2FPcEVWUE9TCndXREZ2NUxvbFBBMGoxWmtwZVpXbmlTa04rVkFVdkdNWHR3S0IvbEo1YVFyVFRHalFhMVNLMmNmY0hmd0lVWlEKck10SEdOTDNDc3IwSDFYR2syWWt1RFRPYTQ5aEx1blhITnlCNHdSRUxjQW9qK1hQaGlIU0t0Q0FwUDkyUTRzMQoxZE1uZDFCVzF3NjFHRXpRb2d2eE9IWmtsQ1lPODdEWndZcXRPOHQ5QVM2K25LMEtsYndBaHFZajJhNGQxR0o2CmdDbWZidEFoTnd0MEZLMTFLdGRSeTRxRFBFSnlVS2pvbUtENVBLZ1EwczZ4Z3dKcW5qckN4WENzbnJqaXNNeU4KMFJnYnh3RUNnWUVBeXp4SWJSUGNRZUplVS9OR1NBVFFxcHZpWVhvenFJRU8za1BXU1ZUSVRxWWRIT1ErdFlsRgpYcG81TTNjWC85MElEUytQMFBteE0ybTRqZ25xOXNOb2p3YWlabmtiSmsxWk5rNVZsWVU3Uml5em1NZmVnVWNtClVEeVR1OUVLYkNBVk0vWGJhaDZHd1o2Vlh4RVZTSHRLN1pDNnJhTjk2TENPaEdDai9kdUFMSUVDZ1lFQS8vR1EKMFhlbm00Y1drZGV5WHNKU2Z5c1AwRkQvT0lONEc4Y1k3WE9QYTl0enM2RGJUbnhOVkRBT0cvT3FqTHNkMDlFTwo2OW8wbEFRWVp2d1F1Y2czZ29xandCRENSS0JlYjRiOUorZGxpU0VlbTZqVndwUnE3MjE0Q2piaWJqbTZJNWZrCnd2Qm9tTEJLU2haNmVaSUoxMGJLOG1iSnBhb3QvdmZvL2lUanB1Y0NnWUJqUEF3aE5wRlZtakoweTFTRjFkUU4KZWhBUGlKdXdxMU9YTTRodVJmZUliNVBIaDZzVytPL21RV2VzdVhuK2RPNTVnYiszU2pRNzVtTTI5NkRDM0tjeApMd3djL1FWRXJuL2hCRjdGbzBoTis0VzJFK0dSUGl4M0FSMGhsL0IrMnl0L000enZRL2lJa2VaZGhQbmZhbFFyCnEzOTdTVmt4UlFSUm50NTBGYm1BQVFLQmdGK0JQWi9jUFcvY3RjQlFNNkFHZFJBOCtsYXFrc0g4MU9uUW5tMmsKcklUN3k2M2d2VlVKTHpYV0JMM0xhLzI5cVFDc1J4d2RQWGRxRzh6NkRDZTNIWGVaMGtiT09oK3ZrKzJiK29WVQpaR0FLT3NpczlLNzZBUGs4NlFrdXQ4bVh3dXliTm1MRG9OUXhIRmVQRWI2aGp3aUV3eUEyMk5IM3NkZ3RuQVNSCnNWMUxBb0dBR3ZJdWUrK1dsdlJVdi9CZmQ3T3JDOXN5L29DTFVPUHVsRkc2UFQzazRHeTRzdkxIWFJjUGs3VVkKWkhLK3JVeFlUL1NkaXNTdVBROTM3NXBHQWxxbzBoOEpMa1JlbXlzOXRxc2RNbFErcFdsMkdqVmVOcVU5UW9EVwoxMlo4YWowaXNmWCtuUUlLRHpORGJtVEc1U0FVa0NFbHd5Z2hjT29CWXZieHRCbzN5K1k9Ci0tLS0tRU5EIFJTQSBQUklWQVRFIEtFWS0tLS0tCg==

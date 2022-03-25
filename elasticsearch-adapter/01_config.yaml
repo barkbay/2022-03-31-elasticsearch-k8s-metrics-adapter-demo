@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-custom-metrics-config
+  namespace: elastic-monitoring
+data:
+  config.yml: |-
+    metricServers:
+      - name: elasticsearch-metrics-cluster
+        serverType: elasticsearch
+        clientConfig:
+          host: https://monitoring-es-http.elastic-monitoring.svc:9200
+          authentication:
+            username: elastic
+            password: ${ELASTICSEARCH_PASSWORD}
+          tls:
+            insecureSkipTLSVerify: true
+        metricSets:
+          - indices: [ 'metricbeat-*' ]
+      - name: my-existing-prometheus-adapter
+        serverType: custom
+        clientConfig:
+          host: https://prometheus-metrics-apiserver.prometheus-custom-metrics.svc
+          tls:
+            insecureSkipTLSVerify: true
